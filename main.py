@@ -1,5 +1,5 @@
 # ===================================================================================
-# === FILE: main.py (CAMERA ONLY MODE - NO MOUSE MOVE) ===
+# === FILE: main.py (FIXED: DEBUG GRID ADDED) ===
 # ===================================================================================
 import sys
 import os
@@ -8,6 +8,7 @@ import numpy as np
 import cv2
 import traceback
 import json
+import math
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +32,14 @@ except ImportError:
 
 from robot import FR5Robot
 import sound_player
+
+# ==========================================
+# 0. CẤU HÌNH CHẾ ĐỘ (CONFIG)
+# ==========================================
+# Đã fix cứng thành False để dùng Camera
+ALLOW_MOUSE_MOVE = False 
+
+print(f"\n=== CHẾ ĐỘ ĐIỀU KHIỂN: {'🖱️ DÙNG CHUỘT (DEBUG)' if ALLOW_MOUSE_MOVE else '📷 DÙNG CAMERA (REAL)'} ===")
 
 # ==========================================
 # 1. KHỞI TẠO
@@ -62,7 +71,7 @@ PIECE_DISPLAY_NAMES = {
 }
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("Xiangqi Robot - Camera Control Only")
+pygame.display.set_caption(f"Xiangqi Robot - Mode: {'MOUSE' if ALLOW_MOUSE_MOVE else 'CAMERA'}")
 
 # ==========================================
 # 2. TRẠNG THÁI GAME
@@ -72,6 +81,7 @@ turn = 'r'
 game_over = False
 winner = None
 last_move = None
+selected_pos = None 
 r_captured = []
 b_captured = []
 move_history = []
@@ -96,7 +106,6 @@ try:
         robot.set_perspective_matrix(cv2.getPerspectiveTransform(dst_pts_logic, src_pts_fake))
     else:
         print("Đang đọc tọa độ từ Robot...")
-        # Đọc điểm G1, G2, G3, G4 từ tay robot 
         err1, data1 = robot.robot.GetRobotTeachingPoint("goc_R1") 
         err2, data2 = robot.robot.GetRobotTeachingPoint("goc_R2") 
         err3, data3 = robot.robot.GetRobotTeachingPoint("goc_R3") 
@@ -121,13 +130,11 @@ except Exception as e:
     if not config.DRY_RUN: sys.exit()
 
 # --- LOAD MODEL YOLO ---
-# Hãy đảm bảo đường dẫn này đúng với máy của bạn
 MODEL_PATH = r"D:\xiangqi_robot_TrainningAI_Final_4\models_chinesechess1\content\runs\detect\train\weights\best.pt"
 try:
     model = YOLO(MODEL_PATH)
 except:
     print(f"❌ LỖI: Không tìm thấy file model tại {MODEL_PATH}")
-    # Fallback path cũ nếu cần
     MODEL_PATH = r"D:\1\xiangqi_robot_TrainningAI_Final_3\models_chinesechess1\content\runs\detect\train\weights\best.pt"
     model = YOLO(MODEL_PATH)
 
@@ -141,10 +148,15 @@ CLASS_ID_TO_INTERNAL_NAME = {
 }
 
 # ==========================================
-# 4. HÀM HỖ TRỢ (GUI & LOGIC)
+# 4. HÀM HỖ TRỢ
 # ==========================================
 def grid_to_pixel(col, row):
     return int(START_X + col * SQUARE_SIZE), int(START_Y + row * SQUARE_SIZE)
+
+def pixel_to_grid(px, py):
+    col = int(round((px - START_X) / SQUARE_SIZE))
+    row = int(round((py - START_Y) / SQUARE_SIZE))
+    return col, row
 
 def draw_ui():
     screen.fill(BOARD_COLOR)
@@ -152,15 +164,15 @@ def draw_ui():
         pygame.draw.rect(screen, BTN_COLOR, BTN_SURRENDER_RECT, border_radius=8)
         txt = UI_FONT.render("ĐẦU HÀNG", True, (255, 255, 255))
         screen.blit(txt, txt.get_rect(center=BTN_SURRENDER_RECT.center))
+        mode_txt = UI_FONT.render(f"MODE: {'MOUSE CLICK' if ALLOW_MOUSE_MOVE else 'CAMERA AI'}", True, (0,0,255))
+        screen.blit(mode_txt, (10, 10))
     
-    # Vẽ bàn cờ
     for r in range(NUM_ROWS): pygame.draw.line(screen, LINE_COLOR, grid_to_pixel(0, r), grid_to_pixel(NUM_COLS - 1, r), 1)
     for c in range(NUM_COLS):
         if c in [0, NUM_COLS - 1]: pygame.draw.line(screen, LINE_COLOR, grid_to_pixel(c, 0), grid_to_pixel(c, NUM_ROWS - 1), 1)
         else:
             pygame.draw.line(screen, LINE_COLOR, grid_to_pixel(c, 0), grid_to_pixel(c, 4), 1)
             pygame.draw.line(screen, LINE_COLOR, grid_to_pixel(c, 5), grid_to_pixel(c, 9), 1)
-    # Cung tướng
     pygame.draw.line(screen, LINE_COLOR, grid_to_pixel(3, 0), grid_to_pixel(5, 2), 1)
     pygame.draw.line(screen, LINE_COLOR, grid_to_pixel(5, 0), grid_to_pixel(5, 2), 1)
     pygame.draw.line(screen, LINE_COLOR, grid_to_pixel(3, 7), grid_to_pixel(5, 9), 1)
@@ -183,17 +195,23 @@ def draw_highlight():
         (s, d) = last_move
         pygame.draw.circle(screen, (0, 255, 0, 100), grid_to_pixel(s[0], s[1]), PIECE_RADIUS + 2, 2)
         pygame.draw.circle(screen, (0, 255, 0, 150), grid_to_pixel(d[0], d[1]), PIECE_RADIUS + 2, 2)
+    if selected_pos:
+        c, r = selected_pos
+        cx, cy = grid_to_pixel(c, r)
+        pygame.draw.circle(screen, (0, 0, 255), (cx, cy), PIECE_RADIUS + 4, 2)
 
 def calibrate_perspective_camera(cap, save_path):
     pts = []
     window = "CALIBRATE"
     cv2.namedWindow(window)
     cv2.setMouseCallback(window, lambda e,x,y,f,p: pts.append((x,y)) if e==1 and len(pts)<4 else None)
-    print("Click 4 góc bàn cờ thực tế theo thứ tự: XeDenTP -> XeDenDP -> XeDoDT -> XeDoTT")
+    print("⚠️ LƯU Ý: Click 4 góc theo thứ tự: 1.TopLeft -> 2.TopRight -> 3.BotRight -> 4.BotLeft")
     while True:
         ret, frame = cap.read()
         if not ret: break
-        for i, p in enumerate(pts): cv2.circle(frame, p, 6, (0,255,0), -1); cv2.putText(frame, str(i+1), p, 1, 2, (0,255,0))
+        for i, p in enumerate(pts): 
+            cv2.circle(frame, p, 6, (0,255,0), -1)
+            cv2.putText(frame, str(i+1), p, 1, 2, (0,255,0))
         cv2.imshow(window, frame)
         if cv2.waitKey(1) == 27 or len(pts)==4: break
     if len(pts)==4:
@@ -209,7 +227,7 @@ def detections_to_grid_occupancy(detections, M):
         name = CLASS_ID_TO_INTERNAL_NAME.get(cls_id)
         if not name: continue
         cx = (x1 + x2) / 2
-        cy = y2 - (y2 - y1) * 0.15 
+        cy = (y1 + y2) / 2
         try:
             dst = cv2.perspectiveTransform(np.array([[[float(cx), float(cy)]]],dtype=np.float32), M)[0][0]
             c, r = int(round(dst[0])), int(round(dst[1]))
@@ -217,49 +235,61 @@ def detections_to_grid_occupancy(detections, M):
         except: pass
     return grid
 
-# Âm thanh
 PIECE_LETTER_TO_SOUND = {'N':'Ma', 'C':'Phao', 'R':'Xe', 'P':'Tot', 'A':'Si', 'E':'Tuong', 'K':None}
 def piece_str_to_sound(piece_str):
     if not piece_str or piece_str == '.': return None
     try: return PIECE_LETTER_TO_SOUND.get(piece_str.split('_')[-1])
     except: return None
 
+def process_human_move(src, dst, p_name):
+    global board, last_move, turn, winner, game_over
+    print(f"[HUMAN] ✅ Đã đi: {p_name} {src}->{dst}")
+    key = ai_book.board_to_key(board)
+    move_history.append({'turn':'r', 'key':key, 'src':src, 'dst':dst})
+    cap_p = board[dst[1]][dst[0]]
+    if cap_p != '.': b_captured.append(cap_p)
+    board, _ = xiangqi.make_temp_move(board, (src, dst))
+    last_move = (src, dst)
+    attacker_sound = piece_str_to_sound(p_name)
+    if cap_p != '.':
+        target_sound = piece_str_to_sound(cap_p)
+        if attacker_sound and target_sound: sound_player.play_capture_sound(attacker_sound, target_sound)
+    else:
+        if attacker_sound: sound_player.play_move_sound(attacker_sound)
+    if xiangqi.get_king_pos('b', board) is None: 
+        winner, game_over = 'r', True
+        ai_book.learn_game(move_history, winner)
+    else: 
+        turn = 'b'
+
 # ==========================================
 # 5. VÒNG LẶP CHÍNH
 # ==========================================
 running = True
 last_sync_time = time.time()
-SYNC_INTERVAL = 1.5 # Tăng độ nhạy cho Camera
+SYNC_INTERVAL = 1.5 
 clock = pygame.time.Clock()
-
-print("\n=== HỆ THỐNG SẴN SÀNG (CHẾ ĐỘ CAMERA) ===")
 
 while running:
     draw_ui(); draw_pieces(); draw_highlight()
     
-    # --- XỬ LÝ SỰ KIỆN (BỎ CLICK CHUỘT VÀO BÀN CỜ) ---
     for event in pygame.event.get():
         if event.type == pygame.QUIT: running = False
-        
-        # Phím tắt Calib lại Camera
         if event.type == pygame.KEYDOWN and event.key == pygame.K_v:
             calibrate_perspective_camera(cap, str(PERSPECTIVE_PATH))
-        
-        # Chuột chỉ dùng cho nút Đầu hàng
         if event.type == pygame.MOUSEBUTTONDOWN:
             mx, my = event.pos
             if BTN_SURRENDER_RECT.collidepoint(mx, my) and not game_over:
                 print("[GAME] BẠN ĐẦU HÀNG!"); winner, game_over = 'b', True
                 ai_book.learn_game(move_history, winner)
 
-    # --- CAMERA ĐỌC LIÊN TỤC ---
+    # --- CAMERA ĐỌC LIÊN TỤC & DEBUG GRID ---
     ret, frame = cap.read()
     detections = []
     if ret:
         try:
-            # Tăng độ tin cậy (conf) lên 0.5 hoặc 0.6
-# Nghĩa là: Phải chắc chắn 60% là quân cờ thì mới nhận, còn mờ mờ ảo ảo thì bỏ qua.
-            results = model.predict(frame, conf=0.60, iou=0.45, verbose=False)
+            # 1. Detect YOLO
+            results = model.predict(frame, conf=0.35, iou=0.45, verbose=False) # Giảm conf xuống 0.50
             for box in results[0].boxes:
                 cls = int(box.cls[0])
                 if cls in CLASS_ID_TO_INTERNAL_NAME:
@@ -267,88 +297,60 @@ while running:
                     detections.append((cls, (x1, y1, x2, y2)))
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
             
-            # Hiển thị điểm chấm đỏ trên bàn cờ camera để dễ debug
-            M_debug = np.load(str(PERSPECTIVE_PATH)) if PERSPECTIVE_PATH.exists() else None
-            if M_debug is not None:
-                _, inv_M = cv2.invert(M_debug)
-                for r in range(NUM_ROWS):
-                    for c in range(NUM_COLS):
-                        pt = cv2.perspectiveTransform(np.array([[[float(c),float(r)]]],dtype=np.float32), inv_M)[0][0]
-                        col = (0,0,255) if board[r][c]!='.' else (0,255,0)
-                        cv2.circle(frame, (int(pt[0]), int(pt[1])), 3, col, -1)
+            # 2. VẼ LƯỚI ẢO (DEBUG) ĐỂ KIỂM TRA LỆCH
+            if os.path.exists(str(PERSPECTIVE_PATH)):
+                M_debug = np.load(str(PERSPECTIVE_PATH))
+                M_inv = np.linalg.inv(M_debug)
+                for r_debug in range(NUM_ROWS):
+                    for c_debug in range(NUM_COLS):
+                        pt_grid = np.array([[[float(c_debug), float(r_debug)]]], dtype=np.float32)
+                        pt_pixel = cv2.perspectiveTransform(pt_grid, M_inv)[0][0]
+                        px, py = int(pt_pixel[0]), int(pt_pixel[1])
+                        # Vẽ chấm đỏ
+                        cv2.circle(frame, (px, py), 3, (0, 0, 255), -1)
+                        if c_debug == 0 and r_debug == 0: cv2.putText(frame, "START", (px, py), 1, 1, (0,0,255), 2)
+
             cv2.imshow("Camera Monitor", frame)
         except: pass
     if cv2.waitKey(1) == ord('q'): running = False
 
-    # --- LOGIC DI CHUYỂN DỰA HOÀN TOÀN VÀO CAMERA ---
-    if time.time() - last_sync_time > SYNC_INTERVAL and turn == 'r' and not game_over:
-        last_sync_time = time.time()
-        M_cam = np.load(str(PERSPECTIVE_PATH)) if os.path.exists(str(PERSPECTIVE_PATH)) else None
-        
-        if M_cam is not None:
-            cam_grid = detections_to_grid_occupancy(detections, M_cam)
-            disappeared = []
-            appeared = []
+    # --- LOGIC DI CHUYỂN CAMERA ---
+    if not ALLOW_MOUSE_MOVE:
+        if time.time() - last_sync_time > SYNC_INTERVAL and turn == 'r' and not game_over:
+            last_sync_time = time.time()
+            M_cam = np.load(str(PERSPECTIVE_PATH)) if os.path.exists(str(PERSPECTIVE_PATH)) else None
             
-            for r in range(NUM_ROWS):
-                for c in range(NUM_COLS):
-                    # Logic có quân, nhưng Camera thấy mất hoặc thấy khác
-                    if board[r][c] != '.' and (cam_grid[r][c] == '.' or cam_grid[r][c] != board[r][c]):
-                        disappeared.append({'pos': (c, r), 'piece': board[r][c]})
-                    # Logic không có (hoặc khác), nhưng Camera thấy có quân mới
-                    if cam_grid[r][c] != '.' and cam_grid[r][c] != board[r][c]:
-                        appeared.append({'pos': (c, r), 'piece': cam_grid[r][c]})
-            
-            # Debug in ra nếu thấy sự thay đổi
-            if disappeared or appeared:
-                 # Lọc bớt nhiễu: Chỉ in nếu thực sự có cả mất và hiện (tức là có di chuyển)
-                 if disappeared and appeared:
-                     print(f"[CAM] Mất: {[x['pos'] for x in disappeared]} -> Hiện: {[x['pos'] for x in appeared]}")
+            if M_cam is not None:
+                cam_grid = detections_to_grid_occupancy(detections, M_cam)
+                disappeared = []
+                appeared = []
+                
+                for r in range(NUM_ROWS):
+                    for c in range(NUM_COLS):
+                        if board[r][c] != '.' and (cam_grid[r][c] == '.' or cam_grid[r][c] != board[r][c]):
+                            disappeared.append({'pos': (c, r), 'piece': board[r][c]})
+                        if cam_grid[r][c] != '.' and cam_grid[r][c] != board[r][c]:
+                            appeared.append({'pos': (c, r), 'piece': cam_grid[r][c]})
+                
+                # In ít log hơn để dễ nhìn
+                if disappeared and appeared:
+                     print(f"[CAM] Change detected...")
 
-            valid_move = None
-            # Logic ghép cặp: Tìm quân đỏ di chuyển
-            for app in appeared:
-                for dis in disappeared:
-                    # Điều kiện: Quân xuất hiện phải là quân Đỏ (người chơi)
-                    # và phải khớp loại quân (hoặc là ăn quân)
-                    if app['piece'].startswith('r'):
-                        # Nếu quân xuất hiện đúng là quân vừa mất đi (Move thường hoặc Ăn quân)
-                        if dis['piece'] == app['piece'] and dis['pos'] != app['pos']:
-                            valid_move = (dis['pos'], app['pos'], app['piece'])
-                            break
-                if valid_move: break
-            
-            if valid_move:
-                src, dst, p_name = valid_move
-                # CHECK LUẬT
-                if xiangqi.is_valid_move(src, dst, board, 'r'):
-                    print(f"[HUMAN] ✅ Camera xác nhận đi: {p_name} {src}->{dst}")
-                    
-                    key = ai_book.board_to_key(board)
-                    move_history.append({'turn':'r', 'key':key, 'src':src, 'dst':dst})
-                    
-                    cap_p = board[dst[1]][dst[0]]
-                    if cap_p != '.': b_captured.append(cap_p)
-                    
-                    board, _ = xiangqi.make_temp_move(board, (src, dst))
-                    last_move = (src, dst)
-                    
-                    # Âm thanh
-                    attacker_sound = piece_str_to_sound(p_name)
-                    if cap_p != '.':
-                        target_sound = piece_str_to_sound(cap_p)
-                        if attacker_sound and target_sound:
-                            sound_player.play_capture_sound(attacker_sound, target_sound)
+                valid_move = None
+                for app in appeared:
+                    for dis in disappeared:
+                        if app['piece'].startswith('r'):
+                            if dis['piece'] == app['piece'] and dis['pos'] != app['pos']:
+                                valid_move = (dis['pos'], app['pos'], app['piece'])
+                                break
+                    if valid_move: break
+                
+                if valid_move:
+                    src, dst, p_name = valid_move
+                    if xiangqi.is_valid_move(src, dst, board, 'r'):
+                        process_human_move(src, dst, p_name)
                     else:
-                        if attacker_sound: sound_player.play_move_sound(attacker_sound)
-                        
-                    if xiangqi.get_king_pos('b', board) is None: 
-                        winner, game_over = 'r', True
-                        ai_book.learn_game(move_history, winner)
-                    else: 
-                        turn = 'b'
-                else:
-                    print(f"[IGN] ⚠️ Thấy {src}->{dst} nhưng SAI LUẬT (Kiểm tra lại góc cam)")
+                        print(f"[IGN] ⚠️ Thấy {src}->{dst} nhưng SAI LUẬT (Check lại Calibration!)")
 
     # --- AI TURN ---
     if turn == 'b' and not game_over:
@@ -356,10 +358,8 @@ while running:
         try:
             best = ai.pick_best_move(board, 'b')
             if best:
-                try:
-                    s, d = best 
-                except: s, d = best[0], best[1] # Safe unpack
-
+                try: s, d = best 
+                except: s, d = best[0], best[1]
                 print(f"[AI] Đi: {s}->{d}")
                 
                 key = ai_book.board_to_key(board)
@@ -373,11 +373,9 @@ while running:
                     attacker_sound = piece_str_to_sound(board[s[1]][s[0]])
                     if is_cap:
                         target_sound = piece_str_to_sound(cap_p)
-                        if attacker_sound and target_sound:
-                            sound_player.play_capture_sound(attacker_sound, target_sound)
+                        if attacker_sound and target_sound: sound_player.play_capture_sound(attacker_sound, target_sound)
                     else:
                         if attacker_sound: sound_player.play_move_sound(attacker_sound)
-
                     robot.move_piece(s[0], s[1], d[0], d[1], is_cap)
                 
                 board, _ = xiangqi.make_temp_move(board, best)
@@ -388,7 +386,7 @@ while running:
                     ai_book.learn_game(move_history, winner)
                 else: 
                     turn = 'r'
-                    print("[GAME] Chờ 4s cho người chơi..."); last_sync_time = time.time() + 4.0
+                    print("[GAME] Chờ người chơi..."); last_sync_time = time.time() + 4.0
             else:
                 print("[AI] Hết nước"); winner, game_over = 'r', True
                 ai_book.learn_game(move_history, winner)
